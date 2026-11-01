@@ -8,9 +8,11 @@
 Run by .github/workflows/triage.yaml, or by hand to see what it would say. Prints nothing when the pull request
 does not touch projects/.
 
-The pull request is read as data through the GitHub API: nothing from it is checked out or executed, the only host
-contacted is api.github.com, and a read-only token is enough. Text from the pull request or the enrolled repository
-reaches the comment only through code(), so it cannot inject Markdown.
+The pull request is read as data through the GitHub API: nothing from it is checked out or executed, and a read-only
+token is enough. The token goes to api.github.com alone; the only other hosts contacted are pypi.org, crates.io and
+packages.ecosyste.ms (an index of the registries), which are asked about public packages. Text from the pull
+request, the enrolled repository or one of those hosts reaches the comment only through code(), so it cannot
+inject Markdown.
 
 Requires PyYAML, as tools/validate.py does.
 """
@@ -39,7 +41,7 @@ import validate
 API = "https://api.github.com"
 RAW = "application/vnd.github.raw"
 MAX_RATE_LIMIT_WAIT = 65  # seconds
-# No answer we need is larger. A file we only search (a license, a security policy) is read up to the smaller limit.
+# A larger answer is refused. A file we only search (a license, a security policy) is read up to the smaller limit.
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_TEXT_BYTES = 256 * 1024
 # The workflow finds the comment to update by this first line.
@@ -50,8 +52,15 @@ OK, WARN, FAIL, INFO = "✅", "⚠️", "❌", "ℹ️"
 NOW = datetime.now(timezone.utc)
 YEAR_AGO = NOW - timedelta(days=365)
 # "Established", "active" and "critical" have no published numbers. These only decide when a row gets a warning.
-ESTABLISHED_MONTHS = 12
+ESTABLISHED_MONTHS = 6
 STALE_MONTHS = 12
+# How many of a repository's latest issues, and of its latest pull requests, are looked at for who opened them.
+RECENT_THREADS = 50
+# Whoever wrote this many of the last 100 commits is part of the project, whatever role GitHub shows for them.
+REGULAR_COMMITS = 5
+# Fewer people than this from outside the project among those who opened the latest issues and pull requests is
+# warned about. One person can open hundreds of either in a repository of their own; they cannot be other people.
+FEW_OUTSIDERS = 3
 # A project below both is warned about. Either alone is not: a busy young project scores well with few stars, and
 # a quiet, widely used one has the stars but a middling score.
 FEW_STARS = 100
@@ -83,6 +92,13 @@ ASSOCIATIONS = {
 RECENT_MERGES = """query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {
   pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
     nodes { mergedBy { login } } } } }"""
+# Who opened the repository's latest issues and pull requests, and who wrote its latest commits.
+PARTICIPANTS = """query($owner: String!, $name: String!, $threads: Int!) { repository(owner: $owner, name: $name) {
+  issues(first: $threads, orderBy: {field: CREATED_AT, direction: DESC}) {
+    nodes { authorAssociation author { __typename login } } }
+  pullRequests(first: $threads, orderBy: {field: CREATED_AT, direction: DESC}) {
+    nodes { authorAssociation author { __typename login } } }
+  defaultBranchRef { target { ... on Commit { history(first: 100) { nodes { author { user { login } } } } } } } } }"""
 
 # SPDX ids, as GitHub reports them, of the licenses we accept without a second look. BSL-1.0 is the Boost license;
 # the Business Source License is BUSL-1.1, which GitHub does not recognise and reports as "Other".
@@ -118,14 +134,32 @@ TOP_CONTRIBUTORS = 15
 # The company each of these accounts gives on its profile. One request, where the REST API takes one per account:
 # the workflow's token is allowed 1,000 requests an hour.
 COMPANIES = "query($ids: [ID!]!) { nodes(ids: $ids) { ... on User { company } } }"
+# When the repository's latest releases were made. The REST API lists every asset of every release with them: tens
+# of megabytes for a project that has many of both.
+RECENT_RELEASES = """query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {
+  releases(first: 100, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { createdAt } } } }"""
 ISSUE_WINDOW_DAYS = 90
+
+# PyPI's most downloaded packages of the last 30 days: a list made monthly and kept in a GitHub repository.
+PYPI_TOP = "repos/hugovk/top-pypi-packages/contents/top-pypi-packages.min.json"
+PYPI_TOP_PAGE = "https://hugovk.github.io/top-pypi-packages/"
+# How many of PyPI's packages with a name like the repository's are looked up to see whether one is from it.
+PYPI_CANDIDATES = 5
+# npm publishes no such list. ecosyste.ms gives npm's names in order of downloads, at most this many in an answer.
+NPM_TOP = 10000
+NPM_TOP_PAGE = "https://packages.ecosyste.ms/registries/npmjs.org/packages?sort=downloads&order=desc"
+# crates.io lists its crates by their downloads of the last 90 days, 100 to a page: this many pages are read.
+CRATES_PAGES = 10
+CRATES_TOP_PAGE = "https://crates.io/crates?sort=recent-downloads"
+# A GitHub repository as a package's metadata names it: any scheme, often with .git, or a page within it (its issues).
+PACKAGE_REPO = re.compile(r"(?<![\w.-])github\.com[/:]([\w.-]+/[\w.-]+?)(?:\.git)?(?:[/#?]|$)", re.ASCII)
 
 
 class ApiError(Exception):
-    """A request to the GitHub API failed. `status` is the HTTP status, or 0 if there was no usable response."""
+    """A request to an API failed. `status` is the HTTP status, or 0 if there was no usable response."""
 
-    def __init__(self, status: int, path: str, problem: str = ""):
-        super().__init__(f"GitHub API: {problem or status or 'no response'} for {path}")
+    def __init__(self, api: str, status: int, path: str, problem: str = ""):
+        super().__init__(f"{api}: {problem or status or 'no response'} for {path}")
         self.status = status
 
 
@@ -146,53 +180,58 @@ def retry_delay(error: urllib.error.HTTPError) -> float | None:
     return max(delay, 1) if delay <= MAX_RATE_LIMIT_WAIT else None
 
 
-class StayOnGitHub(urllib.request.HTTPRedirectHandler):
+class StayOnApi(urllib.request.HTTPRedirectHandler):
     """Follow a redirect (a renamed repository) only within the API, so that the token is sent nowhere else."""
 
+    def __init__(self, base: str):
+        self.base = base
+
     def redirect_request(self, request, fp, code, msg, headers, newurl):
-        if not newurl.startswith(f"{API}/"):
+        if not newurl.startswith(f"{self.base}/"):
             return None  # urllib then raises the redirect as an HTTPError
         return super().redirect_request(request, fp, code, msg, headers, newurl)
 
 
-class GitHub:
-    """A client for api.github.com that only reads. Callers quote every path segment that comes from a pull request."""
+class Api:
+    """A client for one API that only reads. Callers quote every path segment that comes from a pull request or
+    from a list of packages."""
 
-    opener = urllib.request.build_opener(StayOnGitHub)
+    def __init__(self, name: str, base: str, headers: dict[str, str] | None = None):
+        self.name, self.base = name, base
+        self.headers = {"User-Agent": "oss-scanner-triage", **(headers or {})}
+        self.opener = urllib.request.build_opener(StayOnApi(base))
 
-    def __init__(self, token: str | None):
-        self.headers = {
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "oss-scanner-triage",
-        }
-        if token:
-            self.headers["Authorization"] = f"Bearer {token}"
-
-    def fetch(self, path: str, accept: str | None = None, body: dict | None = None, **params) -> tuple[bytes, str]:
+    def fetch(
+        self, path: str, accept: str | None = None, body: dict | None = None, whole: bool = False, **params
+    ) -> tuple[bytes, str]:
         """GET a path, or POST `body` to it. Return the response's body and its Link header. Of a file asked for
-        as text, only the start is read."""
-        limit = MAX_TEXT_BYTES if accept == RAW else MAX_RESPONSE_BYTES
+        as text, only the start is read, unless all of it is asked for with `whole`."""
+        cut = accept == RAW and not whole
+        limit = MAX_TEXT_BYTES if cut else MAX_RESPONSE_BYTES
         query = urlencode({key: value for key, value in params.items() if value is not None})
         headers = {**self.headers, "Accept": accept} if accept else self.headers
         data = json.dumps(body).encode() if body else None
-        request = urllib.request.Request(f"{API}/{path}{'?' + query if query else ''}", data=data, headers=headers)
+        url = f"{self.base}/{path}{'?' + query if query else ''}"
+        request = urllib.request.Request(url, data=data, headers=headers)
         for last_try in (False, True):
             try:
                 with self.opener.open(request, timeout=30) as response:
-                    answer, length = response.read(limit), response.headers.get("Content-Length")
+                    answer, length = response.read(limit + 1), response.headers.get("Content-Length")
                     # Unlike a read to the end, a read of n bytes does not notice a connection that was cut off.
                     if length and length.isdigit() and len(answer) < min(int(length), limit):
                         raise http.client.IncompleteRead(answer)
-                    return answer, response.headers.get("Link") or ""
+                    # The start of a text is of use, the start of a JSON answer is not: asking again will not help.
+                    if len(answer) > limit and not cut:
+                        raise ApiError(self.name, 0, path, "answer too large")
+                    return answer[:limit], response.headers.get("Link") or ""
             except urllib.error.HTTPError as error:
                 delay = retry_delay(error)
                 if last_try or delay is None:
-                    raise ApiError(error.code, path) from None
+                    raise ApiError(self.name, error.code, path) from None
             except (OSError, http.client.HTTPException):
                 delay = 2  # a dropped or cut-off connection
                 if last_try:
-                    raise ApiError(0, path) from None
+                    raise ApiError(self.name, 0, path) from None
             time.sleep(delay)
 
     def get(self, path: str, **params):
@@ -208,6 +247,17 @@ class GitHub:
                 return None
             raise
 
+
+class GitHub(Api):
+    """api.github.com: the one API that is sent the token."""
+
+    def __init__(self, token: str | None):
+        super().__init__(
+            "GitHub API", API, {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+        )
+        if token:
+            self.headers["Authorization"] = f"Bearer {token}"
+
     def count(self, path: str, **params) -> int:
         """How many items a list has: asked for one per page, the number of the last page is the count."""
         try:
@@ -218,7 +268,7 @@ class GitHub:
             return 0  # e.g. the comments of a repository with issues turned off
         last = re.search(r'[?&]page=(\d+)[^>]*>; rel="last"', link)
         if not last and 'rel="next"' in link:
-            raise ApiError(0, path, "no count")  # GitHub leaves the last page out of some expensive listings
+            raise ApiError(self.name, 0, path, "no count")  # GitHub leaves the last page out of some expensive listings
         return int(last.group(1)) if last else len(json.loads(body))
 
     def total(self, kind: str, query: str) -> int:
@@ -238,8 +288,14 @@ class GitHub:
         """Run a GraphQL query, for what the REST API cannot say in one request."""
         answer = json.loads(self.fetch("graphql", body={"query": query, "variables": variables})[0])
         if not answer.get("data"):
-            raise ApiError(0, "graphql", "query refused")
+            raise ApiError(self.name, 0, "graphql", "query refused")
         return answer["data"]  # with "errors" beside it when only part could be answered, such as a deleted account
+
+
+# Where packages are looked up: none of these is sent the token.
+PYPI = Api("PyPI", "https://pypi.org")
+CRATES = Api("crates.io", "https://crates.io/api/v1")
+ECOSYSTEMS = Api("ecosyste.ms", "https://packages.ecosyste.ms/api/v1", {"Accept": "application/json"})
 
 
 def code(text: object, limit: int = 120) -> str:
@@ -274,6 +330,12 @@ def ago(when: datetime) -> str:
     if days < 730:
         return f"{days // 30} months ago"
     return f"{days // 365} years ago"
+
+
+def ordinal(place: int) -> str:
+    """A place in a list, as 1st or 2,652nd. Not as #2652: GitHub would link that to the pull request of that number."""
+    suffix = "th" if 10 <= place % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(place % 10, "th")
+    return f"{place:,}{suffix}"
 
 
 # --- reading the pull request and the repository ---
@@ -397,7 +459,43 @@ def standing_row(meta: dict) -> tuple[str, str]:
 
 
 def popularity_row(meta: dict) -> tuple[str, str]:
-    return INFO, f"{meta['stargazers_count']:,} stars · {meta['forks_count']:,} forks"
+    forks, watchers = meta["forks_count"], meta["subscribers_count"]
+    result = f"{meta['stargazers_count']:,} stars · {forks:,} forks · {watchers:,} watching"
+    absent = [what for what, count in (("forks", forks), ("watchers", watchers)) if not count]
+    if absent:
+        return WARN, f"no {' and no '.join(absent)}: little sign that others use it ({result})"
+    return INFO, result
+
+
+def outsiders_row(gh: GitHub, slug: str, meta: dict, login: str) -> tuple[str, str]:
+    """How many people from outside the project opened its latest issues and pull requests? Not counted: the
+    repository's owner, whoever opened this pull request, anyone GitHub shows as a maintainer, anyone who wrote a
+    good share of the latest commits, and bots."""
+    owner, name = slug.split("/")
+    repository = gh.graphql(PARTICIPANTS, owner=owner, name=name, threads=RECENT_THREADS)["repository"]
+    threads = repository["issues"]["nodes"] + repository["pullRequests"]["nodes"]
+    if not threads:
+        return WARN, "the repository has no issues or pull requests"
+
+    history = ((repository["defaultBranchRef"] or {}).get("target") or {}).get("history") or {"nodes": []}
+    wrote = [((commit["author"] or {}).get("user") or {}).get("login", "").lower() for commit in history["nodes"]]
+    insiders = {meta["owner"]["login"].lower(), login.lower()}
+    insiders |= {person for person in set(wrote) if wrote.count(person) >= REGULAR_COMMITS}
+    outsiders, theirs = set(), 0
+    for thread in threads:
+        author = thread["author"] or {}  # no author: a deleted account
+        person = author.get("login", "").lower()
+        if author.get("__typename") != "User" or thread["authorAssociation"] in ASSOCIATIONS or person in insiders:
+            continue
+        outsiders.add(person)
+        theirs += 1
+
+    result = f"the last {len(threads)} issues and pull requests"
+    if not outsiders:
+        return WARN, f"none: {result} were all opened by the project's own people or by bots"
+    people = "1 person" if len(outsiders) == 1 else f"{len(outsiders)} people"
+    result = f"{people} from outside the project opened {theirs} of {result}"
+    return (WARN if len(outsiders) < FEW_OUTSIDERS else INFO), result
 
 
 def license_row(gh: GitHub, slug: str, meta: dict) -> tuple[str, str]:
@@ -500,25 +598,26 @@ def squash(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
+def likeness(slug: str, name: str) -> int | None:
+    """How like the repository's name, or its owner's, the name of a project or a package is: 0 at best, None if
+    not at all."""
+    key, (owner, repo) = squash(name), (squash(part) for part in slug.split("/"))
+    if key in (repo, owner):
+        return 0 if key == repo else 1
+    # One name inside the other, unless the inner one is so short that it is there by chance.
+    for place, (inner, outer) in enumerate(((repo, key), (key, repo), (owner, key), (key, owner)), start=2):
+        if len(inner) >= 4 and inner in outer:
+            return place
+    return None
+
+
 def oss_fuzz_candidates(slug: str, names: list[str]) -> list[str]:
     """Of OSS-Fuzz's project names, the few that could be this repository's, likeliest first.
 
     OSS-Fuzz has no index by repository, and GitHub's code search is closed to the workflow's token. But a project
     is nearly always named after its repository or the repository's owner (bitcoin-core fuzzes bitcoin/bitcoin):
     of OSS-Fuzz's 1,252 projects on GitHub, this finds 1,183."""
-    owner, repo = (squash(part) for part in slug.split("/"))
-
-    def rank(name: str) -> int | None:
-        key = squash(name)
-        if key in (repo, owner):
-            return 0 if key == repo else 1
-        # One name inside the other, unless the inner one is so short that it is there by chance.
-        for place, (inner, outer) in enumerate(((repo, key), (key, repo), (owner, key), (key, owner)), start=2):
-            if len(inner) >= 4 and inner in outer:
-                return place
-        return None
-
-    ranked = sorted((place, len(name), name) for name in names if (place := rank(name)) is not None)
+    ranked = sorted((place, len(name), name) for name in names if (place := likeness(slug, name)) is not None)
     return [name for _, _, name in ranked[:OSS_FUZZ_CANDIDATES]]
 
 
@@ -623,8 +722,9 @@ def criticality_signals(gh: GitHub, slug: str, meta: dict) -> dict[str, float]:
         if company:
             organisations.add(re.sub(r"inc\.|llc|@|\s", "", company.lower()).rstrip(","))
 
-    releases = gh.get(f"repos/{slug}/releases", per_page=100)
-    recent_releases = sum(1 for release in releases if parse_time(release["created_at"]) > YEAR_AGO)
+    owner, name = slug.split("/")
+    releases = gh.graphql(RECENT_RELEASES, owner=owner, name=name)["repository"]["releases"]["nodes"]
+    recent_releases = sum(1 for release in releases if parse_time(release["createdAt"]) > YEAR_AGO)
     if not releases:
         # A project that tags without publishing releases: assume its tags are spread evenly over its life.
         recent_releases = round(gh.count(f"repos/{slug}/tags") / max((NOW - created).days, 1) * 365)
@@ -659,6 +759,10 @@ def criticality_score(signals: dict[str, float]) -> float:
 
 
 def criticality_row(gh: GitHub, slug: str, meta: dict) -> tuple[str, str]:
+    if meta["fork"]:
+        # A fork carries its parent's commits and contributors, and would be given the parent's score.
+        parent = (meta.get("parent") or {}).get("full_name")
+        return WARN, f"not scored: a fork of {code(parent)}, whose history it carries"
     signals = criticality_signals(gh, slug, meta)
     score = criticality_score(signals)
     result = f"**{score:.2f}** on the [OpenSSF]({CRITICALITY_SOURCE}) scale of 0 to 1"
@@ -667,6 +771,78 @@ def criticality_row(gh: GitHub, slug: str, meta: dict) -> tuple[str, str]:
         result += f": low, and the project has under {FEW_STARS} stars"
     details = ", ".join(f"{name} {value:,}" for name, value in signals.items())
     return (WARN if low else INFO), f"{result}<details><summary>signals</summary>{details}</details>"
+
+
+def is_repository(url: object, slug: str) -> bool:
+    """Does a URL from a package's metadata give this repository, or a page within it?"""
+    match = PACKAGE_REPO.search(url[:300]) if isinstance(url, str) else None
+    return bool(match) and match.group(1).lower() == slug.lower()
+
+
+def pypi_rank(slug: str, names: list[str]) -> tuple[str, int] | None:
+    """Of PyPI's most downloaded packages, most downloaded first, the one from the repository that is most its
+    namesake, and that package's place in the list.
+
+    The list gives names only. Like an OSS-Fuzz project, a package is nearly always named after its repository or
+    the repository's owner, so the few names most like those are looked up on PyPI, which says where each
+    package's source is."""
+    places = enumerate(names, 1)
+    ranked = sorted((like, place, name) for place, name in places if (like := likeness(slug, name)) is not None)
+    for _, place, name in ranked[:PYPI_CANDIDATES]:
+        info = (PYPI.find(f"pypi/{quote(name, safe='')}/json") or {}).get("info") or {}
+        urls = (info.get("home_page"), *(info.get("project_urls") or {}).values())
+        if any(is_repository(url, slug) for url in urls):
+            return name, place
+    return None
+
+
+def npm_rank(slug: str) -> tuple[str, int] | None:
+    """The most downloaded npm package that is from the repository, and its place among all of npm's. ecosyste.ms
+    knows each package's repository, so there is nothing to guess from names."""
+    order = {"sort": "downloads", "order": "desc"}
+    # The first few say enough, and each comes with all that ecosyste.ms knows about the package.
+    url = f"https://github.com/{slug}"
+    packages = ECOSYSTEMS.get("registries/npmjs.org/lookup", repository_url=url, per_page=10, **order)
+    ours = {package["name"] for package in packages}
+    if not ours:
+        return None
+    names = ECOSYSTEMS.get("registries/npmjs.org/package_names", per_page=NPM_TOP, **order)
+    return next(((name, place) for place, name in enumerate(names, 1) if name in ours), None)
+
+
+def crates_rank(slug: str) -> tuple[str, int] | None:
+    """The most downloaded crate that is from the repository, and its place among all crates. crates.io gives each
+    crate's repository in its listing, so there is nothing to guess from names."""
+    for page in range(1, CRATES_PAGES + 1):
+        if page > 1:
+            time.sleep(1)  # crates.io asks for no more than one request a second
+        crates = CRATES.get("crates", sort="recent-downloads", per_page=100, page=page)["crates"]
+        for place, crate in enumerate(crates, (page - 1) * 100 + 1):
+            if is_repository(crate.get("repository"), slug):
+                return crate["name"], place
+    return None
+
+
+def package_rank_row(gh: GitHub, slug: str) -> tuple[str, str]:
+    """Where do the repository's packages stand among the most downloaded of PyPI, npm and crates.io? A registry
+    is looked at only for a repository with code in one of its languages."""
+    languages = gh.get(f"repos/{slug}/languages")
+    ranks = []  # (the registry, the package found and its place, how many places were looked at)
+    if "Python" in languages:
+        names = [row["project"] for row in json.loads(gh.fetch(PYPI_TOP, accept=RAW, whole=True)[0])["rows"]]
+        ranks.append((f"[PyPI]({PYPI_TOP_PAGE})", pypi_rank(slug, names), len(names)))
+    if "JavaScript" in languages or "TypeScript" in languages:
+        ranks.append((f"[npm]({NPM_TOP_PAGE})", npm_rank(slug), NPM_TOP))
+    if "Rust" in languages:
+        ranks.append((f"[crates.io]({CRATES_TOP_PAGE})", crates_rank(slug), CRATES_PAGES * 100))
+    if not ranks:
+        return INFO, "no Python, JavaScript or Rust in the repository, so not looked for on PyPI, npm or crates.io"
+
+    found = [f"{code(rank[0])} is {ordinal(rank[1])} on {registry}" for registry, rank, _ in ranks if rank]
+    missing = [f"the top {looked_at:,} on {registry}" for registry, rank, looked_at in ranks if not rank]
+    if missing:
+        found.append(f"nothing from this repository found in {' or '.join(missing)}")
+    return INFO, f"by downloads: {' · '.join(found)}"
 
 
 # --- putting the comment together ---
@@ -706,7 +882,9 @@ def repository_rows(gh: GitHub, config: dict, beside: set[str], login: str) -> t
     return f"[{slug}]({meta['html_url']})" + (f" at {code(ref)}" if ref else ""), [
         row("Repository", standing_row, meta),
         row("Stars / forks", popularity_row, meta),
+        row("Outside participants", outsiders_row, gh, slug, meta, login),
         row("Criticality score", criticality_row, gh, slug, meta),
+        row("Package rank", package_rank_row, gh, slug),
         row("License", license_row, gh, slug, meta),
         row("Opened by an active maintainer", maintainer_row, gh, slug, meta, login),
         row("Contact in `SECURITY.md`", contact_row, gh, slug, meta, config),
@@ -743,7 +921,7 @@ def triage(gh: GitHub, repo: str, number: int) -> str:
     return (
         f"{heading}Repository: {described} · opened by {code(login)}\n\n"
         f"| | Check | Result |\n|:-:|---|---|\n{table}\n\n"
-        f"<sub>Automated, from public GitHub data, to help reviewers. Enrolment is decided case by case against "
+        f"<sub>Automated, from public data, to help reviewers. Enrolment is decided case by case against "
         f"the [criteria]({CRITERIA}). If you think we got something wrong, please tell us in a reply.</sub>\n"
     )
 

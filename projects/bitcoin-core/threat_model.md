@@ -1,68 +1,96 @@
 # Bitcoin Core threat model
 
-Bitcoin Core validates the Bitcoin blockchain and participates in its peer-to-peer network. It also provides a wallet, JSON-RPC server, command-line tools, and optional local IPC services. Protect consensus correctness, private keys and signing intent, node availability, durable chain and wallet state, and transaction privacy.
+Bitcoin Core is a full node: it validates blocks and transactions, relays them over an unauthenticated P2P network, and serves a wallet and JSON-RPC. In-tree references: `/src/SECURITY.md`, `doc/JSON-RPC-interface.md`, `doc/developer-notes.md`.
 
-## Existing project guidance
+## Security model
 
-Read the checkout's [SECURITY.md](https://github.com/bitcoin/bitcoin/blob/master/SECURITY.md), [JSON-RPC security guidance](https://github.com/bitcoin/bitcoin/blob/master/doc/JSON-RPC-interface.md#security), [fuzzing guide](https://github.com/bitcoin/bitcoin/blob/master/doc/fuzzing.md), [developer notes](https://github.com/bitcoin/bitcoin/blob/master/doc/developer-notes.md), and [test guide](https://github.com/bitcoin/bitcoin/blob/master/test/README.md).
-The project's policies take precedence over this summary.
-Use the scanned checkout for technical instructions, since linked documentation follows `master`.
+What matters most: attacks an unauthenticated peer can run automatically, and wallet fund loss in normal operation.
 
-## Actors and entry points
+### What we protect
 
-Treat unauthenticated peers as adversarial. Trace P2P messages, transactions, blocks, headers, compact blocks, addresses, and transport negotiation through validation, allocation, queues, persistence, and cleanup. Distinguish arbitrary peer input from data that requires valid proof of work, mining, or a consensus-valid transaction or block.
+1. Consensus: no inflation, no theft through validation, no chain split. A block must validate the same way on every node and every time, whatever the version, configuration, platform, cache state (signature, script execution, coins) or history of restarts and reorgs.
+2. Funds: with no attacker access to the local machine, the wallet does not lose funds or keys, pay more or elsewhere than the user approved, sign what the user did not approve, or reveal key material.
+3. Availability: an unauthenticated peer cannot crash, stall or exhaust a node, keep it off the best chain, stop it relaying or serving peers, or cheaply isolate it from honest peers, directly or indirectly (for example through address relay or eviction).
+4. Mining: untrusted input cannot make the node's block templates invalid, stall their creation, or cheaply strip the fees they would collect.
+5. Durable state: block, undo, chainstate, index and wallet data survive restarts, crashes and reorgs.
+6. Anonymity options: with a proxy or `-onlynet`, no connection leaves the configured networks; with `-privatebroadcast`, the node is not revealed as the origin of those transactions. There is no other privacy guarantee: linking identities across networks, inferring transaction origin and fingerprinting are not vulnerabilities.
 
-HTTP parsing occurs before RPC authentication. Review request framing and resource accounting on that path, and REST when enabled. RPC access is privileged and intended for trusted clients. Identify authentication and authorization requirements before claiming a remote attack. Check externally supplied descriptors, PSBTs, transactions, wallet imports, signing requests, and external-signer replies for violations of the user's intended operation. Keep mempool policy separate from consensus and wallet accounting.
+### Who is trusted
 
-Review reorgs, initial synchronization, pruning, snapshot activation, indexes, restart, cancellation, and partial failures. Check thread and callback lifetimes, stale state, arithmetic widths, input-to-output amplification, retained resources, and disk durability. State the exact fault needed for corruption-dependent bugs and establish whether a real producer can create it.
+| Source | Trust | Notes |
+|---|---|---|
+| P2P peers | Untrusted | Inbound and outbound. Inbound connections are cheap to open in bulk. Outbound peers are chosen by the node, hard to obtain and relied on more: state how many outbound slots an attack needs, and treat a cheap way to obtain them as a finding. |
+| Blocks and headers with valid proof of work | Untrusted, costly | State the mining cost. Header chains below the minimum chain work go through headers presync; such chains are cheap to build when they fork from early blocks, so state the fork point and the work it needs. |
+| Relayable fee-paying transactions | Untrusted, costly | State the fees, including replacements. |
+| HTTP before RPC authentication | Untrusted | RPC binds to localhost by default. REST is off by default, unauthenticated and not hardened against resource exhaustion: through REST, only crashes, memory corruption and code execution are findings. Browser-mediated attacks (DNS rebinding, cross-site requests) are out of scope. |
+| Authenticated RPC clients, including `-rpcwhitelist`-restricted ones; IPC clients | Trusted | A failure only they can trigger, including resource exhaustion and aborts, is a bug, not a vulnerability, unless it bypasses authentication. |
+| PSBTs, transactions and descriptors given to the wallet | Untrusted for funds safety, not liveness | The wallet must sign and report exactly what the user was shown. Crashes, errors and resource use from this content are bugs, unless they involve memory corruption. |
+| The local machine: datadir, `bitcoin.conf`, wallet files, external signer | Trusted | Anything needing local access or write access to these files is out of scope (crafted wallets, snapshots, mempool dumps, permissions, links). A corrupt file counts only if a remote party or a crash can produce it; an injected failure only if an ordinary event like a full disk produces the same state. |
+| Build system, `depends/`, CI, Guix | Out of scope | |
 
-Check UTXO conservation across connect and disconnect, cache flags and undo data, and consistent validation across full blocks, compact blocks, RPC submission, and reindex. Invalid blocks must not poison retained state. Examine validation-cache provenance, asynchronous script-check lifetimes, one-shot compact-block reconstruction, mutable block-index ordering keys, and preservation of dirty entries after failed database writes. Review peer scheduling, headers synchronization, transaction requests and orphans, package accounting, and AddrMan eclipse resistance.
+### Defaults
 
-Persisted inputs include block and undo files, peer state, mempool data, fee estimates, snapshots, and wallet databases. Trace their producer as well as their reader. For wallets, review database transactionality, encryption, and PSBT merge and finalization alongside the operation approved by the user.
+Report against the default configuration. Off by default: REST, ZMQ, IPC, `-txindex` and the other indexes, `-peerblockfilters`, `-privatebroadcast`, pruning, assumeutxo, RPC beyond localhost. A finding that needs one of these is lower severity; name the options. BIP37 bloom filter serving (`-peerbloomfilters`) is out of scope.
 
-IPC is a local interface. Distinguish a libmultiprocess API defect from a failure reachable through Bitcoin Core's actual callers. Trace generated proxies, callbacks, connection teardown, shared state, and timeouts. Local access and non-default features are prerequisites to record when assessing impact.
+## What counts as a vulnerability
 
-## Scope and ownership
+- Release-build semantics. `NDEBUG` builds are refused, so `assert` and `Assert()` always abort: a reachable one is a remote crash. In release builds `Assume()` does nothing and `CHECK_NONFATAL()` throws (an RPC error); report only their release-build consequence.
+- Regtest enables `-checkmempool` and `-checkblockindex`; mainnet does not. A check that untrusted input can make fail is a finding: report the inconsistency, and what the bad state breaks if you can find it, but not the check's own abort as a crash. Take CPU and memory measurements with both set to 0.
+- A remotely reachable AddressSanitizer report is in scope on its own. An UndefinedBehaviorSanitizer report needs a demonstrated consequence.
+- Reachability. Defects in libraries, utilities, subtrees or the `bitcoinkernel` API count only when `bitcoind` or the wallet reaches them with attacker input, through P2P, HTTP, RPC, REST or a file Bitcoin Core writes itself. Input beyond the protocol limits (4 MB P2P messages, 32 MiB HTTP bodies) and allocation failure (which terminates by design) are not reports.
+- Resource exhaustion. Cost proportional to input, and bounded per-peer state freed on disconnect, are expected; amplification alone is not a finding. In scope:
+  - one P2P message or pre-authentication HTTP request taking about a second or more of CPU in an optimised build without sanitizers (messages are handled on one thread); cold-disk wall time alone does not count;
+  - one message leading to more than 1 GiB of additional memory use;
+  - memory that grows without bound over a connection's lifetime or across reconnects (slow growth is lower severity);
+  - per-peer-bounded memory totalling 4 GiB or more across 200 simultaneous connections; measure one peer, then extrapolate only as far as global limits allow (the orphanage, mempool and other shared structures cap the total regardless of peer count);
+  - sustained disk I/O far beyond what serving the same requests normally costs (forced flushes, compaction storms, write amplification); measure bytes read and written in `/proc/<pid>/io`;
+  - bandwidth amplification, only when extreme.
 
-The whole repository is in scope for source review. The priorities below guide investigation rather than exclude other code.
+  Retained memory outranks transient allocation. Measure, mark each figure as measured or extrapolated, and give the number of connections needed. The thresholds are orders of magnitude, so this VM is accurate enough.
+- Log flooding needs a way around `-logratelimit`, which is on by default.
+- Not implementation vulnerabilities: protocol-level properties (pinning, replacement cycling, selfish mining) unless Bitcoin Core deviates from its documented behaviour; the known issues BIP54 addresses (timewarp, slow-to-validate blocks, 64-byte transaction Merkle ambiguity, duplicate coinbases); known test network issues such as testnet block storms.
+- Bugs, not vulnerabilities: `bitcoin-cli` behaviour; GUI crashes; control characters from peer data reaching the operator's terminal through logs or RPC output; logs or responses only the operator sees; backlogs behind `-walletnotify` or `-blocknotify`; wallet transactions that fail safe (the mempool rejects them or the RPC errors); fee estimation accuracy, unless an attacker can cheaply and significantly skew the estimates; relay or orphan gaps that heal when another peer or a later announcement supplies the transaction (one peer persistently blocking propagation is in scope); stale cache entries cleared on a tip change; intended behaviour, often asserted by a test.
 
-Prioritize consensus divergence or inflation, remotely reachable memory corruption and node failure, key or fund loss, persistent corruption, and practical resource exhaustion. Also investigate authenticated, optional, local-file, and supported platform-specific paths when there is a concrete security failure. A parser accepting malformed bytes or a theoretical large allocation alone does not establish a vulnerability.
+## Severity
 
-The image enables wallet, IPC, ZMQ, unit tests, and benchmarks. It does not build the Qt GUI or exercise other operating systems or 32-bit architectures. These are build and execution limits, not exclusions from source review. Record any additional prerequisites needed to reproduce a finding outside this environment. Bundled libraries remain in scope when Bitcoin Core reaches the affected code, but identify their upstream owner before proposing changes, including libsecp256k1, LevelDB, libmultiprocess, and minisketch. Do not conflate a standalone library contract with demonstrated node impact.
+Bitcoin Core's categories:
 
-## Build and bounded validation
+- Critical: network-wide: inflation, theft through consensus, a permanent chain split, remote code execution.
+- High: remote, in the default configuration: a crash or long stall, memory corruption, code execution needing local network access, the wallet leaking keys or signing what the user did not approve.
+- Medium: limited scope or exploitability, or non-default settings: resource exhaustion as above, failures in non-default features, a crash needing local network access.
+- Low: hard to exploit or minor impact, such as needing non-default configuration or a privileged position. Leaks through the anonymity options are usually Low or Medium.
 
-The checkout is `/src`. The normal build is `/src/build`, with binaries under `/src/build/bin`, functional tests under `/src/build/test/functional`, and a compilation database at `/src/build/compile_commands.json`. Unit tests and four functional smoke tests run during the Docker build. Dependencies, including the Python IPC bindings and `/qa-assets`, are fetched before network access is removed. `DIR_UNIT_TEST_DATA` points to `/qa-assets/unit_test_data` so the external script test data is available.
+Give a severity and the reason; do not inflate it. Focus on Medium and above, and send Low only with a working reproducer. Do not send non-security bugs.
 
-Previous release binaries are not fetched, so backwards-compatibility tests that require them cannot run offline in this image.
-The `interface_usdt_*` tracepoint tests need BPF tooling that is not installed.
-These are execution limits, not source-review exclusions.
-Check test output for skips before reporting coverage. The selected IPC and ZMQ tests require the installed `pycapnp` and `python3-zmq` bindings.
+## Evidence required
 
-Use repository-native tests with an independent expected result. Reproduce only against disposable regtest nodes and temporary files. Never connect test nodes to public Bitcoin networks or use real wallets or funds. Keep CPU, memory, disk, runtime, and test parallelism bounded. Prefer a small deterministic counterexample, fault injection, or accounting assertion over exhausting the environment. Initial compilation uses ten jobs in the larger build environment. Cap recompilation and test parallelism at two jobs in the scanner VM.
+- A reproducer against the unmodified build in this image, with default limits and timers and no test-only hooks: a regtest functional test. Use a unit test only when a functional test cannot reach the code, and say why. Include a passing control run. Code reading alone is not enough.
+- Whether it reproduces in `/src/build`, not only under sanitizers.
+- What the attacker needs: connection direction and count, permissions, proof of work, fees, options, timing.
+- The scanned revision, when the bug was introduced, and which releases it affects.
+- One root cause per report. Check the history and tests for an earlier fix, for tests asserting the behaviour as intended, and for pull requests closed without merging.
+- A minimal patch with a test that fails before it and passes after.
+
+## Scope
+
+Everything shipped in release binaries is in scope. Prioritise code that input from unauthenticated peers reaches.
+
+Subtrees (`src/secp256k1`, `src/leveldb`, `src/crc32c`, `src/minisketch`, `src/ipc/libmultiprocess`) count when Bitcoin Core reaches the affected code, including through normal operation, such as a race in LevelDB's compaction thread; name the subtree.
+
+Only Linux x86-64 is built. Other platforms, 32-bit builds and `src/qt` are low priority and need a concrete argument that a supported release reaches the code. Out of scope: `test/`, `src/test/`, `src/bench/`, `contrib/`, `ci/`, `depends/`, except code shipped in release binaries. Tracing is out of scope: USDT tracepoints only act when a privileged local user attaches to them.
+
+## Build
+
+`/src` is the checkout, with git history.
+
+- `/src/build`: release-like, GCC 14, `-O2 -g`, the `dev-mode` preset without the GUI and the fuzz binary (wallet, IPC, ZMQ, USDT, bench, kernel library), with `compile_commands.json`. Its behaviour is what counts.
+- `/src/build_asan`: clang with the ASan CI job's sanitizers (address, float-divide-by-zero, integer, undefined). Run reproducers through its `test/functional/test_runner.py`, and unit tests through `test/with_sanitizer_env.py`, to get Bitcoin Core's sanitizer settings and suppressions. The integer sanitizer flags unsigned wraparound, which is defined; it needs a consequence like any UBSan report.
+
+The unit tests and four functional tests ran at build time; results are in the build log, and failures did not stop the build. Previous-release binaries and BPF tooling (`interface_usdt_*`) are not available; check test output for skips.
+
+Use disposable regtest nodes only; never connect to public networks or use real funds. Cap compilation and test parallelism at two jobs. Prefer a small deterministic counterexample to exhausting the VM.
 
 ```sh
 ctest --test-dir /src/build --output-on-failure -j2 --timeout 300
 timeout --kill-after=5 600 python3 /src/build/test/functional/test_runner.py -j2 interface_ipc.py interface_zmq.py p2p_invalid_messages.py wallet_basic.py
 ```
-
-The separate `/src/build_fuzz` build uses the project's `libfuzzer` preset with AddressSanitizer and UndefinedBehaviorSanitizer. Existing harnesses are under `/src/src/test/fuzz`, and seed corpora are under `/qa-assets/fuzz_corpora`. Select the matching corpus for a target and keep each run bounded. Corpus initialization can exceed libFuzzer's run and time limits. Use an external timeout to bound the whole process, with five seconds for termination before a forced kill:
-
-```sh
-timeout --kill-after=5 180 env FUZZ=process_message python3 /src/build_fuzz/test/with_sanitizer_env.py /src/build_fuzz/bin/fuzz /qa-assets/fuzz_corpora/process_message -runs=100 -max_total_time=30 -rss_limit_mb=2048
-```
-
-The generated `with_sanitizer_env.py` wrapper applies Core's sanitizer defaults and suppression files, while preserving explicit environment overrides.
-The generated fuzz test runner at `/src/build_fuzz/test/fuzz/test_runner.py` also uses this wrapper. Select targets explicitly and keep its parallelism at two jobs.
-
-## Evidence and severity
-
-Record the exact revision, build options, affected versions, attacker control, enabled-by-default status, prerequisites, and observed consequence. Keep source-only hypotheses separate from targeted tests and reproductions against the real node or library build. For resource findings, distinguish a protocol-derived bound from the largest tested input and measured victim impact. A standalone model or harness crash needs a demonstrated path to the application before claiming a node attack.
-
-Identify sanitizer and hardened-library instrumentation in the evidence. An abort enabled by extra assertions is not proof of a crash in the project's normal configuration. Reproduce the claimed production consequence in the relevant supported build.
-
-Use the current [Bitcoin Core security advisory policy](https://bitcoincore.org/en/security-advisories/) to calibrate severity. Critical concerns protocol-level theft, inflation, or permanent network-wide splits. High generally requires significant default-remote impact with potential for widespread disruption. Medium covers noticeable degradation with limited scope or exploitability. Low covers minor impact or difficult exploitation. Bug-class labels, an assertion, or a sanitizer report do not determine severity on their own. Keep confidence, remediation urgency, and disclosure timing separate.
-
-Check available Git history and existing tests for the same root cause and remediation. Identify any duplicate or already-fixed failure. Record when comparison with current upstream proposals needs later online triage by the security contacts. Keep patches focused and follow Bitcoin Core's contribution rules. Where useful, establish current behavior before a fix and update the same test to assert the corrected result.
-
-Send findings privately to `security@bitcoincore.org` as specified by [SECURITY.md](https://github.com/bitcoin/bitcoin/blob/master/SECURITY.md). Do not put suspected vulnerabilities, reproducer details, private review history, or unreviewed findings into public issues or PRs. Include the smallest bounded reproducer, actual output, expected result, and relevant evidence limits in each report. Disclosure decisions belong to the project's security contacts.

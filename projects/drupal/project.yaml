@@ -1,0 +1,4 @@
+repo: https://git.drupalcode.org/project/drupal.git#main
+primary_contact: security@drupal.org
+homepage: https://www.drupal.org
+disabled: false
